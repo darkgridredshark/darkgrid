@@ -1,25 +1,24 @@
 import os
-import requests
-import sqlite3
-from flask import Flask, request, jsonify
 import time
+import sqlite3
+import requests
+from flask import Flask, request, jsonify
 
 # ---------------------------
-# Flask App & Uploads
+# App Configuration
 # ---------------------------
-app = Flask(_name_)
+app = Flask(__name__)
+
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ---------------------------
-# Environment Variables
-# ---------------------------
-VT_API_KEY = os.environ.get("VT_API_KEY")
-ANYRUN_API_KEY = os.environ.get("ANYRUN_API_KEY")
-DB_FILE = os.environ.get("DB_FILE", "malware.db")
+VT_API_KEY = os.getenv("VT_API_KEY")
+ANYRUN_API_KEY = os.getenv("ANYRUN_API_KEY")
+DB_FILE = os.getenv("DB_FILE", "malware.db")
+
 
 # ---------------------------
-# Database Setup
+# Database
 # ---------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -38,49 +37,87 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
 
-# ---------------------------
-# VirusTotal API Integration
-# ---------------------------
-def check_virustotal(file_path=None, file_hash=None):
-    headers = {"x-apikey": VT_API_KEY}
-    if file_path:
-        with open(file_path, "rb") as f:
-            response = requests.post("https://www.virustotal.com/api/v3/files",
-                                     headers=headers, files={"file": f})
-        result = response.json()
-        vt_id = result.get("data", {}).get("id")
-        report_resp = requests.get(f"https://www.virustotal.com/api/v3/analyses/{vt_id}", headers=headers)
-        return report_resp.json()
-    elif file_hash:
-        response = requests.get(f"https://www.virustotal.com/api/v3/files/{file_hash}", headers=headers)
-        return response.json()
 
 # ---------------------------
-# Any.Run API Integration
+# VirusTotal
+# ---------------------------
+def check_virustotal(file_path):
+    if not VT_API_KEY:
+        return {}
+
+    headers = {"x-apikey": VT_API_KEY}
+
+    try:
+        with open(file_path, "rb") as f:
+            upload = requests.post(
+                "https://www.virustotal.com/api/v3/files",
+                headers=headers,
+                files={"file": f},
+                timeout=60
+            )
+
+        upload.raise_for_status()
+        analysis_id = upload.json().get("data", {}).get("id")
+
+        if not analysis_id:
+            return {}
+
+        # Poll once (VT free tier may delay)
+        report = requests.get(
+            f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+            headers=headers,
+            timeout=60
+        )
+
+        return report.json()
+
+    except Exception as e:
+        print("VirusTotal error:", e)
+        return {}
+
+
+# ---------------------------
+# Any.Run
 # ---------------------------
 def submit_anyrun(file_path):
-    """
-    Submit file to Any.Run for dynamic analysis.
-    Polls report until ready (~2 mins max).
-    """
-    url = "https://any.run/api/v2/tasks"
-    headers = {"Authorization": f"Bearer {ANYRUN_API_KEY}"}
-    with open(file_path, "rb") as f:
-        files = {"file": f}
-        response = requests.post(url, headers=headers, files=files)
-    task = response.json()
-    task_id = task.get("id")
+    if not ANYRUN_API_KEY:
+        return {}
 
-    # Poll for report
-    report_url = f"https://any.run/api/v2/tasks/{task_id}/report/json"
-    for _ in range(20):  # 20 attempts, ~2 mins
-        r = requests.get(report_url, headers=headers)
-        if r.status_code == 200:
-            return r.json()
-        time.sleep(6)
-    return {"error": "Any.Run report not ready"}
+    headers = {"Authorization": f"Bearer {ANYRUN_API_KEY}"}
+
+    try:
+        with open(file_path, "rb") as f:
+            response = requests.post(
+                "https://any.run/api/v2/tasks",
+                headers=headers,
+                files={"file": f},
+                timeout=60
+            )
+
+        response.raise_for_status()
+        task_id = response.json().get("id")
+
+        if not task_id:
+            return {}
+
+        report_url = f"https://any.run/api/v2/tasks/{task_id}/report/json"
+
+        # Poll up to 2 minutes
+        for _ in range(20):
+            r = requests.get(report_url, headers=headers, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            time.sleep(6)
+
+        return {}
+
+    except Exception as e:
+        print("Any.Run error:", e)
+        return {}
+
 
 # ---------------------------
 # AI Risk Scoring
@@ -88,16 +125,19 @@ def submit_anyrun(file_path):
 def ai_risk_score(vt_report, anyrun_report):
     score = 0
 
-    # VT detections
-    positives = vt_report.get("data", {}).get("attributes", {}).get("last_analysis_stats", {}).get("malicious", 0)
-    score += min(positives * 5, 50)  # Max 50 points from VT
+    positives = (
+        vt_report.get("data", {})
+        .get("attributes", {})
+        .get("last_analysis_stats", {})
+        .get("malicious", 0)
+    )
 
-    # Any.Run behavior scoring
-    behavior_summary = anyrun_report.get("behavior", {}).get("summary", {})
-    anyrun_score = 50 if behavior_summary else 20
+    score += min(positives * 5, 50)
+
+    behavior = anyrun_report.get("behavior", {})
+    anyrun_score = 50 if behavior else 20
     score += anyrun_score
 
-    # Risk level
     if score >= 80:
         level = "HIGH"
     elif score >= 40:
@@ -108,8 +148,9 @@ def ai_risk_score(vt_report, anyrun_report):
     summary = f"AI Risk Level: {level}, Score: {score}/100"
     return score, summary, positives, anyrun_score
 
+
 # ---------------------------
-# Upload & Analyze Endpoint
+# Analyze Endpoint
 # ---------------------------
 @app.route("/analyze", methods=["POST"])
 def analyze_file():
@@ -117,23 +158,28 @@ def analyze_file():
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
+
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
+
     filepath = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(filepath)
 
-    # Get reports
     vt_report = check_virustotal(filepath)
     anyrun_report = submit_anyrun(filepath)
 
-    # AI scoring
-    ai_score, summary, vt_positives, anyrun_score = ai_risk_score(vt_report, anyrun_report)
+    ai_score, summary, vt_pos, any_score = ai_risk_score(
+        vt_report, anyrun_report
+    )
 
-    # Store in DB
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO reports (filename, vt_positives, anyrun_score, ai_score, ai_summary)
+        INSERT INTO reports
+        (filename, vt_positives, anyrun_score, ai_score, ai_summary)
         VALUES (?, ?, ?, ?, ?)
-    """, (file.filename, vt_positives, anyrun_score, ai_score, summary))
+    """, (file.filename, vt_pos, any_score, ai_score, summary))
+
     report_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -145,8 +191,9 @@ def analyze_file():
         "summary": summary
     })
 
+
 # ---------------------------
-# Get Report by ID
+# Get Single Report
 # ---------------------------
 @app.route("/report/<int:report_id>", methods=["GET"])
 def get_report(report_id):
@@ -159,12 +206,17 @@ def get_report(report_id):
     if not row:
         return jsonify({"error": "Report not found"}), 404
 
-    keys = ["id","filename","vt_positives","anyrun_score","ai_score","ai_summary","created_at"]
-    report = dict(zip(keys, row))
-    return jsonify(report)
+    keys = [
+        "id", "filename", "vt_positives",
+        "anyrun_score", "ai_score",
+        "ai_summary", "created_at"
+    ]
+
+    return jsonify(dict(zip(keys, row)))
+
 
 # ---------------------------
-# Dashboard Endpoint
+# Dashboard (JSON)
 # ---------------------------
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
@@ -174,11 +226,25 @@ def dashboard():
     rows = cur.fetchall()
     conn.close()
 
-    keys = ["id","filename","vt_positives","anyrun_score","ai_score","ai_summary","created_at"]
+    keys = [
+        "id", "filename", "vt_positives",
+        "anyrun_score", "ai_score",
+        "ai_summary", "created_at"
+    ]
+
     return jsonify([dict(zip(keys, r)) for r in rows])
 
+
 # ---------------------------
-# Main
+# Health Check (For Render)
 # ---------------------------
-if _name_ == "_main_":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=True)
+@app.route("/")
+def health():
+    return jsonify({"status": "RedShark API running"})
+
+
+# ---------------------------
+# Local Run (Gunicorn handles production)
+# ---------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
